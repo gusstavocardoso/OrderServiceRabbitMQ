@@ -1,0 +1,156 @@
+name: CI — Order Service
+
+# ─────────────────────────────────────────────
+#  Triggers
+# ─────────────────────────────────────────────
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+  # Disparo manual via GitHub UI ou API
+  workflow_dispatch:
+    inputs:
+      test_suite:
+        description: 'Quais testes executar?'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all        # unit + integration
+          - unit       # apenas unitários (sem banco)
+          - integration # apenas integração (precisa do banco)
+
+# ─────────────────────────────────────────────
+#  Variáveis globais
+# ─────────────────────────────────────────────
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # ═══════════════════════════════════════════
+  #  JOB 1 — Testes Unitários
+  #  Não precisam de nenhum serviço externo
+  # ═══════════════════════════════════════════
+  unit-tests:
+    name: 🧪 Testes Unitários
+    runs-on: ubuntu-latest
+
+    # Roda sempre no push/PR; no disparo manual, só se 'unit' ou 'all'
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.test_suite == 'unit' ||
+      github.event.inputs.test_suite == 'all'
+
+    steps:
+      - name: 📥 Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📦 Instalar dependências
+        run: npm ci
+
+      - name: 🧪 Executar testes unitários com coverage
+        run: npm run test:coverage
+
+      - name: 📊 Upload relatório de coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # ═══════════════════════════════════════════
+  #  JOB 2 — Testes de Integração
+  #  Requerem PostgreSQL como serviço
+  # ═══════════════════════════════════════════
+  integration-tests:
+    name: 🔗 Testes de Integração
+    runs-on: ubuntu-latest
+
+    # Roda sempre no push/PR; no disparo manual, só se 'integration' ou 'all'
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.test_suite == 'integration' ||
+      github.event.inputs.test_suite == 'all'
+
+    # Sobe o PostgreSQL como container de serviço no runner do CI
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orderuser
+          POSTGRES_PASSWORD: orderpass
+          POSTGRES_DB: orderdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: 📥 Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📦 Instalar dependências
+        run: npm ci
+
+      - name: 🗄️ Aplicar migrations no banco de dados
+        run: psql -h localhost -U orderuser -d orderdb -f src/migrations/init.sql
+        env:
+          PGPASSWORD: orderpass
+
+      - name: 🔗 Executar testes de integração
+        run: npm run test:integration
+        env:
+          NODE_ENV: test
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: orderuser
+          DB_PASSWORD: orderpass
+          DB_NAME: orderdb
+          # RabbitMQ é mockado nos testes de integração — não precisa do serviço real
+          RABBITMQ_URL: amqp://guest:guest@localhost:5672
+
+  # ═══════════════════════════════════════════
+  #  JOB 3 — Status Check (bloqueante)
+  #  Garante que o PR só pode ser mergeado
+  #  se unit + integration passaram
+  # ═══════════════════════════════════════════
+  ci-status:
+    name: ✅ CI Status
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    if: always()
+
+    steps:
+      - name: Verificar se todos os jobs passaram
+        run: |
+          if [[ "${{ needs.unit-tests.result }}" == "skipped" && "${{ needs.integration-tests.result }}" == "skipped" ]]; then
+            echo "❌ Nenhum teste foi executado — verifique o parâmetro test_suite"
+            exit 1
+          fi
+          if [[ "${{ needs.unit-tests.result }}" == "failure" ]]; then
+            echo "❌ Testes unitários falharam"
+            exit 1
+          fi
+          if [[ "${{ needs.integration-tests.result }}" == "failure" ]]; then
+            echo "❌ Testes de integração falharam"
+            exit 1
+          fi
+          echo "✅ Todos os testes passaram!"
